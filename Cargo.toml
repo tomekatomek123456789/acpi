@@ -1,6 +1,6 @@
-#[workspace]
-#members = ["tools/aml_tester", "tools/acpi_dumper"]
-#resolver = "2"
+[workspace]
+members = ["tools/aml_tester", "tools/acpi_dumper"]
+resolver = "2"
 
 [package]
 name = "acpi"
