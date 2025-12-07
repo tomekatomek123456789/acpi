@@ -201,13 +201,10 @@ where
         }
     }
 
-    pub fn install_region_handler<RH>(&self, space: RegionSpace, handler: RH)
-    where
-        RH: RegionHandler + 'static,
-    {
+    pub fn install_region_handler(&self, space: RegionSpace, handler: Box<dyn RegionHandler + 'static>) {
         let mut handlers = self.region_handlers.lock();
         assert!(handlers.get(&space).is_none(), "Tried to install handler for same space twice!");
-        handlers.insert(space, Box::new(handler));
+        handlers.insert(space, handler);
     }
 
     /// Initialize the namespace - this should be called after all tables have been loaded and
