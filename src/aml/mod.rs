@@ -150,8 +150,22 @@ where
         let interpreter = Interpreter::new(platform.handler.clone(), dsdt.revision, registers, facs);
         load_table(&interpreter, dsdt)?;
 
+        // Load SSDTs with error recovery: continue loading remaining tables even if one
+        // fails. This matches ACPICA's acpi_tb_load_namespace() behavior which explicitly
+        // ignores errors during SSDT loading to get as many tables loaded as possible.
+        let mut tables_loaded = 0u32;
+        let mut tables_failed = 0u32;
         for ssdt in platform.tables.ssdts() {
-            load_table(&interpreter, ssdt)?;
+            match load_table(&interpreter, ssdt) {
+                Ok(()) => tables_loaded += 1,
+                Err(err) => {
+                    warn!("ACPI: Failed to load SSDT: {:?}. Continuing with remaining tables.", err);
+                    tables_failed += 1;
+                }
+            }
+        }
+        if tables_failed > 0 {
+            warn!("ACPI: Loaded {} SSDTs, {} failed to load.", tables_loaded, tables_failed);
         }
 
         Ok(interpreter)
@@ -250,9 +264,13 @@ where
                         .evaluate_if_present(AmlName::from_str("_STA").unwrap().resolve(path)?, vec![])
                     {
                         Ok(Some(result)) => {
-                            let Object::Integer(result) = *result else { panic!() };
-                            let status = DeviceStatus(result);
-                            status.present() && status.functioning()
+                            if let Object::Integer(result) = *result {
+                                let status = DeviceStatus(result);
+                                status.present() && status.functioning()
+                            } else {
+                                warn!("_STA for device {} returned non-integer type: {:?}. Assuming present.", path, result.typ());
+                                true
+                            }
                         }
                         Ok(None) => true,
                         Err(err) => {
@@ -2299,28 +2317,39 @@ where
 
         let read_region = match field.kind {
             FieldUnitKind::Normal { ref region } => region,
-            
+
             FieldUnitKind::Bank { ref region, ref bank, bank_value } => {
-            //FieldUnitKind::Bank { .. } => {
-                // TODO: put the bank_value in the bank
-                //todo!();
-                warn!("ACPI: Bank switching required (Bank: {:?}, Val: {:X}) but not implemented. Returning raw region.", bank, bank_value);
-        
-                // Zwracamy region danych (tak jak w Normal). 
-                // Ryzyko: Jeśli bank jest źle ustawiony, odczytamy złe dane, ale system nie padnie. (może na S520 to zadziała)
+                // Write the bank_value into the bank register to select the correct bank,
+                // then access the data region. This matches ACPICA exfldio.c behavior.
+                trace!("ACPI: BankField read - selecting bank value {:#X}", bank_value);
+                if let Object::FieldUnit(ref bank_field) = **bank {
+                    if let Err(err) = self.do_field_write(bank_field, Object::Integer(bank_value).wrap()) {
+                        warn!("ACPI: Failed to write bank value {:#X}: {:?}. Continuing with raw region.", bank_value, err);
+                    }
+                } else {
+                    warn!("ACPI: Bank register is not a FieldUnit ({:?}), skipping bank select.", bank.typ());
+                }
                 region
-            },
+            }
+
             FieldUnitKind::Index { ref index, ref data } => {
-            //FieldUnitKind::Index { .. } => {
-                // TODO: configure the correct index
-                //todo!();
-                warn!("ACPI: Index access required (Index: {:?}) but not implemented. Returning data register.", index);
+                // Write field.bit_index into the index register, then read from data register.
+                // This matches ACPICA exfldio.c IndexField handling.
+                let index_value = (field.bit_index / 8) as u64;
+                trace!("ACPI: IndexField read - writing index value {:#X}", index_value);
+                if let Object::FieldUnit(ref index_field) = **index {
+                    if let Err(err) = self.do_field_write(index_field, Object::Integer(index_value).wrap()) {
+                        warn!("ACPI: Failed to write index value {:#X}: {:?}. Continuing with data register.", index_value, err);
+                    }
+                } else {
+                    warn!("ACPI: Index register is not a FieldUnit ({:?}), skipping index write.", index.typ());
+                }
                 data
             }
         };
         let Object::OpRegion(ref read_region) = **read_region else {
             return Err(AmlError::ObjectNotOfExpectedType {
-            expected: ObjectType::FieldUnit, // najbliższy sensowny typ
+            expected: ObjectType::FieldUnit,
             got: read_region.typ(),
             });
         };
@@ -2371,18 +2400,36 @@ where
 
         let write_region = match field.kind {
             FieldUnitKind::Normal { ref region } => region,
-            // FieldUnitKind::Bank { ref region, ref bank, bank_value } => {
-            FieldUnitKind::Bank { .. } => {
-                // TODO: put the bank_value in the bank
-                todo!();
+
+            FieldUnitKind::Bank { ref region, ref bank, bank_value } => {
+                // Write the bank_value into the bank register to select the correct bank,
+                // then write to the data region. This matches ACPICA exfldio.c behavior.
+                trace!("ACPI: BankField write - selecting bank value {:#X}", bank_value);
+                if let Object::FieldUnit(ref bank_field) = **bank {
+                    if let Err(err) = self.do_field_write(bank_field, Object::Integer(bank_value).wrap()) {
+                        warn!("ACPI: Failed to write bank value {:#X}: {:?}. Continuing with raw region.", bank_value, err);
+                    }
+                } else {
+                    warn!("ACPI: Bank register is not a FieldUnit ({:?}), skipping bank select.", bank.typ());
+                }
+                region
             }
-            // FieldUnitKind::Index { ref index, ref data } => {
-            FieldUnitKind::Index { .. } => {
-                // TODO: configure the correct index
-                todo!();
+
+            FieldUnitKind::Index { ref index, ref data } => {
+                // Write field.bit_index into the index register, then write to data register.
+                // This matches ACPICA exfldio.c IndexField handling.
+                let index_value = (field.bit_index / 8) as u64;
+                trace!("ACPI: IndexField write - writing index value {:#X}", index_value);
+                if let Object::FieldUnit(ref index_field) = **index {
+                    if let Err(err) = self.do_field_write(index_field, Object::Integer(index_value).wrap()) {
+                        warn!("ACPI: Failed to write index value {:#X}: {:?}. Continuing with data register.", index_value, err);
+                    }
+                } else {
+                    warn!("ACPI: Index register is not a FieldUnit ({:?}), skipping index write.", index.typ());
+                }
+                data
             }
         };
-        // Analogicznie w do_field_write, linia ~2393:
         let Object::OpRegion(ref write_region) = **write_region else {
             return Err(AmlError::ObjectNotOfExpectedType {
                 expected: ObjectType::FieldUnit,
@@ -2447,32 +2494,32 @@ where
         trace!("Native field read. Region = {:?}, offset = {:#x}, length={:#x}", region, offset, length);
 
         match region.space {
-            RegionSpace::SystemMemory => Ok({
+            RegionSpace::SystemMemory => {
                 let address = region.base as usize + offset;
                 match length {
-                    1 => self.handler.read_u8(address) as u64,
-                    2 => self.handler.read_u16(address) as u64,
-                    4 => self.handler.read_u32(address) as u64,
-                    8 => self.handler.read_u64(address),
-                    _ => panic!(),
+                    1 => Ok(self.handler.read_u8(address) as u64),
+                    2 => Ok(self.handler.read_u16(address) as u64),
+                    4 => Ok(self.handler.read_u32(address) as u64),
+                    8 => Ok(self.handler.read_u64(address)),
+                    _ => Err(AmlError::InvalidAccessWidth(length)),
                 }
-            }),
-            RegionSpace::SystemIO => Ok({
+            }
+            RegionSpace::SystemIO => {
                 let address = region.base as u16 + offset as u16;
                 match length {
-                    1 => self.handler.read_io_u8(address) as u64,
-                    2 => self.handler.read_io_u16(address) as u64,
-                    4 => self.handler.read_io_u32(address) as u64,
-                    _ => panic!(),
+                    1 => Ok(self.handler.read_io_u8(address) as u64),
+                    2 => Ok(self.handler.read_io_u16(address) as u64),
+                    4 => Ok(self.handler.read_io_u32(address) as u64),
+                    _ => Err(AmlError::InvalidAccessWidth(length)),
                 }
-            }),
+            }
             RegionSpace::PciConfig => {
                 let address = self.pci_address_for_device(&region.parent_device_path)?;
                 match length {
                     1 => Ok(self.handler.read_pci_u8(address, offset as u16) as u64),
                     2 => Ok(self.handler.read_pci_u16(address, offset as u16) as u64),
                     4 => Ok(self.handler.read_pci_u32(address, offset as u16) as u64),
-                    _ => panic!(),
+                    _ => Err(AmlError::InvalidAccessWidth(length)),
                 }
             }
 
@@ -2491,7 +2538,7 @@ where
                         2 => handler.read_u16(region, offset).map(Into::into),
                         4 => handler.read_u32(region, offset).map(Into::into),
                         8 => handler.read_u64(region, offset),
-                        _ => panic!(),
+                        _ => Err(AmlError::InvalidAccessWidth(length)),
                     }
                 } else {
                     Err(AmlError::NoHandlerForRegionAccess(region.space))
@@ -2523,7 +2570,7 @@ where
                     2 => self.handler.write_u16(address, value as u16),
                     4 => self.handler.write_u32(address, value as u32),
                     8 => self.handler.write_u64(address, value),
-                    _ => panic!(),
+                    _ => return Err(AmlError::InvalidAccessWidth(length)),
                 }
                 Ok(())
             }
@@ -2533,7 +2580,7 @@ where
                     1 => self.handler.write_io_u8(address, value as u8),
                     2 => self.handler.write_io_u16(address, value as u16),
                     4 => self.handler.write_io_u32(address, value as u32),
-                    _ => panic!(),
+                    _ => return Err(AmlError::InvalidAccessWidth(length)),
                 }
                 Ok(())
             }
@@ -2543,7 +2590,7 @@ where
                     1 => self.handler.write_pci_u8(address, offset as u16, value as u8),
                     2 => self.handler.write_pci_u16(address, offset as u16, value as u16),
                     4 => self.handler.write_pci_u32(address, offset as u16, value as u32),
-                    _ => panic!(),
+                    _ => return Err(AmlError::InvalidAccessWidth(length)),
                 }
                 Ok(())
             }
@@ -2563,7 +2610,7 @@ where
                         2 => handler.write_u16(region, offset, value as u16),
                         4 => handler.write_u32(region, offset, value as u32),
                         8 => handler.write_u64(region, offset, value),
-                        _ => panic!(),
+                        _ => Err(AmlError::InvalidAccessWidth(length)),
                     }
                 } else {
                     Err(AmlError::NoHandlerForRegionAccess(region.space))
@@ -3206,6 +3253,9 @@ pub enum AmlError {
     PrtInvalidGsi,
     PrtInvalidSource,
     PrtNoEntry,
+
+    /// An invalid access width was used for a region access (e.g. a 3-byte read from SystemIO).
+    InvalidAccessWidth(usize),
 
     /// This is emitted to signal that the library does not support the requested behaviour. This
     /// should eventually never be emitted.
