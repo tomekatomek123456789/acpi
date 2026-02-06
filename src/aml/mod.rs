@@ -2299,15 +2299,23 @@ where
 
         let read_region = match field.kind {
             FieldUnitKind::Normal { ref region } => region,
-            // FieldUnitKind::Bank { ref region, ref bank, bank_value } => {
-            FieldUnitKind::Bank { .. } => {
+            
+            FieldUnitKind::Bank { ref region, ref bank, bank_value } => {
+            //FieldUnitKind::Bank { .. } => {
                 // TODO: put the bank_value in the bank
-                todo!();
-            }
-            // FieldUnitKind::Index { ref index, ref data } => {
-            FieldUnitKind::Index { .. } => {
+                //todo!();
+                warn!("ACPI: Bank switching required (Bank: {:?}, Val: {:X}) but not implemented. Returning raw region.", bank, bank_value);
+        
+                // Zwracamy region danych (tak jak w Normal). 
+                // Ryzyko: Jeśli bank jest źle ustawiony, odczytamy złe dane, ale system nie padnie. (może na S520 to zadziała)
+                region
+            },
+            FieldUnitKind::Index { ref index, ref data } => {
+            //FieldUnitKind::Index { .. } => {
                 // TODO: configure the correct index
-                todo!();
+                //todo!();
+                warn!("ACPI: Index access required (Index: {:?}) but not implemented. Returning data register.", index);
+                data
             }
         };
         let Object::OpRegion(ref read_region) = **read_region else { panic!() };
