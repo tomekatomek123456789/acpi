@@ -463,6 +463,19 @@ pub trait Handler: Clone {
     #[cfg(feature = "aml")]
     fn release(&self, mutex: Handle);
 
+    /// Called when AML executes a Notify opcode. The OS should handle the notification
+    /// for the given device path and notification value. In ACPICA, this dispatches to
+    /// registered notify handlers. Common notification values:
+    ///   - 0x00: Bus Check
+    ///   - 0x01: Device Check
+    ///   - 0x02: Device Wake
+    ///   - 0x03: Eject Request
+    ///   - 0x80+: Device-specific
+    #[cfg(feature = "aml")]
+    fn handle_notify(&self, device_path: aml::namespace::AmlName, value: u64) {
+        log::info!("ACPI Notify: device={}, value={:#X}", device_path, value);
+    }
+
     #[cfg(feature = "aml")]
     fn breakpoint(&self) {}
 

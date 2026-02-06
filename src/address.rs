@@ -163,7 +163,7 @@ where
                     16 => unsafe { core::ptr::read_volatile(mapping.virtual_start.as_ptr() as *const u16) as u64 },
                     32 => unsafe { core::ptr::read_volatile(mapping.virtual_start.as_ptr() as *const u32) as u64 },
                     64 => unsafe { core::ptr::read_volatile(mapping.virtual_start.as_ptr() as *const u64) },
-                    _ => panic!(),
+                    _ => return Err(AcpiError::InvalidGenericAddress),
                 };
                 Ok(value)
             }
@@ -172,11 +172,14 @@ where
                     8 => self.handler.read_io_u8(self.gas.address as u16) as u64,
                     16 => self.handler.read_io_u16(self.gas.address as u16) as u64,
                     32 => self.handler.read_io_u32(self.gas.address as u16) as u64,
-                    _ => panic!(),
+                    _ => return Err(AcpiError::InvalidGenericAddress),
                 };
                 Ok(value)
             }
-            _ => unimplemented!(),
+            _ => {
+                warn!("Tried to read GAS of unsupported address space {:?}", self.gas.address_space);
+                Err(AcpiError::LibUnimplemented)
+            }
         }
     }
 
@@ -197,7 +200,7 @@ where
                         core::ptr::write_volatile(mapping.virtual_start.as_ptr() as *mut u32, value as u32);
                     },
                     64 => unsafe { core::ptr::write_volatile(mapping.virtual_start.as_ptr() as *mut u64, value) },
-                    _ => panic!(),
+                    _ => return Err(AcpiError::InvalidGenericAddress),
                 }
                 Ok(())
             }
@@ -206,11 +209,14 @@ where
                     8 => self.handler.write_io_u8(self.gas.address as u16, value as u8),
                     16 => self.handler.write_io_u16(self.gas.address as u16, value as u16),
                     32 => self.handler.write_io_u32(self.gas.address as u16, value as u32),
-                    _ => panic!(),
+                    _ => return Err(AcpiError::InvalidGenericAddress),
                 }
                 Ok(())
             }
-            _ => unimplemented!(),
+            _ => {
+                warn!("Tried to write GAS of unsupported address space {:?}", self.gas.address_space);
+                Err(AcpiError::LibUnimplemented)
+            }
         }
     }
 }
@@ -242,7 +248,22 @@ fn gas_decode_access_bit_width(gas: GenericAddress) -> Result<u8, AcpiError> {
             _ => Err(AcpiError::InvalidGenericAddress),
         }
     } else {
-        // TODO: work out access size based on alignment of the address
-        todo!()
+        /*
+         * Work out access size based on the alignment of the address. This follows ACPICA's
+         * `acpi_hw_get_access_bit_width` logic for APEI registers with non-zero bit offsets.
+         *
+         * We round up the total width (bit_offset + bit_width) to the next power-of-two
+         * aligned native access size. If the result exceeds 64 bits, we cap at 64.
+         */
+        let total_bits = gas.bit_offset as u16 + gas.bit_width as u16;
+        if total_bits <= 8 {
+            Ok(8)
+        } else if total_bits <= 16 {
+            Ok(16)
+        } else if total_bits <= 32 {
+            Ok(32)
+        } else {
+            Ok(64)
+        }
     }
 }
