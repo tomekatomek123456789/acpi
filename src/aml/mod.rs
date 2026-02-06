@@ -2318,8 +2318,12 @@ where
                 data
             }
         };
-        let Object::OpRegion(ref read_region) = **read_region else { panic!() };
-
+        let Object::OpRegion(ref read_region) = **read_region else {
+            return Err(AmlError::ObjectNotOfExpectedType {
+            expected: ObjectType::FieldUnit, // najbliższy sensowny typ
+            got: read_region.typ(),
+            });
+        };
         /*
          * TODO: it might be worth having a fast path here for reads that don't do weird
          * unaligned accesses, which I'm guessing might be relatively common on real
@@ -2378,7 +2382,13 @@ where
                 todo!();
             }
         };
-        let Object::OpRegion(ref write_region) = **write_region else { panic!() };
+        // Analogicznie w do_field_write, linia ~2393:
+        let Object::OpRegion(ref write_region) = **write_region else {
+            return Err(AmlError::ObjectNotOfExpectedType {
+                expected: ObjectType::FieldUnit,
+                got: write_region.typ(),
+            });
+        };
 
         // TODO: if the region wants locking, do that
 
