@@ -47,7 +47,7 @@ use core::{
     str::{self, FromStr},
     sync::atomic::{AtomicU64, Ordering},
 };
-use log::{info, trace, warn};
+use log::{error, info, trace, warn};
 use namespace::{AmlName, Namespace, NamespaceLevelKind};
 use object::{
     DeviceStatus,
@@ -148,7 +148,13 @@ where
 
         let dsdt = platform.tables.dsdt()?;
         let interpreter = Interpreter::new(platform.handler.clone(), dsdt.revision, registers, facs);
-        load_table(&interpreter, dsdt)?;
+
+        // Load the DSDT with error recovery. ACPICA continues even if the DSDT has errors
+        // during module-level code execution, as the namespace definitions are still valuable.
+        // A partial namespace is better than no namespace at all.
+        if let Err(err) = load_table(&interpreter, dsdt) {
+            error!("ACPI: Failed to fully load DSDT: {:?}. Continuing with partial namespace.", err);
+        }
 
         // Load SSDTs with error recovery: continue loading remaining tables even if one
         // fails. This matches ACPICA's acpi_tb_load_namespace() behavior which explicitly
@@ -2549,6 +2555,35 @@ where
             Output::Integer(value) => value,
         };
 
+        match field.kind {
+            FieldUnitKind::Index { ref index, ref data } => {
+                // IndexField: write field.bit_index into the index register, then read from
+                // the data register. Both index and data are FieldUnits that we access
+                // recursively. This matches ACPICA exfldio.c IndexField handling where
+                // AcpiExInsertIntoField/AcpiExExtractFromField are used on the sub-fields.
+                let index_value = (field.bit_index / 8) as u64;
+                trace!("ACPI: IndexField read - writing index value {:#X}", index_value);
+                if let Object::FieldUnit(ref index_field) = **index {
+                    self.do_field_write(index_field, Object::Integer(index_value).wrap())?;
+                } else {
+                    warn!("ACPI: Index register is not a FieldUnit ({:?}), skipping index write.", index.typ());
+                }
+
+                // Read from the data register (which is a FieldUnit, not an OpRegion)
+                if let Object::FieldUnit(ref data_field) = **data {
+                    return self.do_field_read(data_field);
+                } else {
+                    warn!("ACPI: Data register is not a FieldUnit ({:?}), falling back to OpRegion read.", data.typ());
+                    // Fall through to OpRegion-based read below won't work, return error
+                    return Err(AmlError::ObjectNotOfExpectedType {
+                        expected: ObjectType::FieldUnit,
+                        got: data.typ(),
+                    });
+                }
+            }
+            _ => {}
+        }
+
         let read_region = match field.kind {
             FieldUnitKind::Normal { ref region } => region,
 
@@ -2566,25 +2601,21 @@ where
                 region
             }
 
-            FieldUnitKind::Index { ref index, ref data } => {
-                // Write field.bit_index into the index register, then read from data register.
-                // This matches ACPICA exfldio.c IndexField handling.
-                let index_value = (field.bit_index / 8) as u64;
-                trace!("ACPI: IndexField read - writing index value {:#X}", index_value);
-                if let Object::FieldUnit(ref index_field) = **index {
-                    if let Err(err) = self.do_field_write(index_field, Object::Integer(index_value).wrap()) {
-                        warn!("ACPI: Failed to write index value {:#X}: {:?}. Continuing with data register.", index_value, err);
-                    }
-                } else {
-                    warn!("ACPI: Index register is not a FieldUnit ({:?}), skipping index write.", index.typ());
-                }
-                data
-            }
+            // Index is handled above and returns early
+            FieldUnitKind::Index { .. } => unreachable!(),
         };
+
+        // For Normal and Bank fields, the region object should be an OpRegion.
+        // However, on some firmware (like Futro S520), the region might itself be a
+        // FieldUnit. In that case, read it recursively as a field.
+        if let Object::FieldUnit(ref nested_field) = **read_region {
+            warn!("ACPI: Region object is a FieldUnit instead of OpRegion, reading recursively.");
+            return self.do_field_read(nested_field);
+        }
         let Object::OpRegion(ref read_region) = **read_region else {
             return Err(AmlError::ObjectNotOfExpectedType {
-            expected: ObjectType::FieldUnit,
-            got: read_region.typ(),
+                expected: ObjectType::OpRegion,
+                got: read_region.typ(),
             });
         };
         /*
@@ -2632,6 +2663,33 @@ where
         };
         let access_width_bits = field.flags.access_type_bytes()? * 8;
 
+        match field.kind {
+            FieldUnitKind::Index { ref index, ref data } => {
+                // IndexField: write field.bit_index into the index register, then write to
+                // the data register. Both are FieldUnits accessed recursively, matching
+                // ACPICA exfldio.c where AcpiExInsertIntoField is used on sub-fields.
+                let index_value = (field.bit_index / 8) as u64;
+                trace!("ACPI: IndexField write - writing index value {:#X}", index_value);
+                if let Object::FieldUnit(ref index_field) = **index {
+                    self.do_field_write(index_field, Object::Integer(index_value).wrap())?;
+                } else {
+                    warn!("ACPI: Index register is not a FieldUnit ({:?}), skipping index write.", index.typ());
+                }
+
+                // Write to the data register (which is a FieldUnit, not an OpRegion)
+                if let Object::FieldUnit(ref data_field) = **data {
+                    return self.do_field_write(data_field, value);
+                } else {
+                    warn!("ACPI: Data register is not a FieldUnit ({:?}).", data.typ());
+                    return Err(AmlError::ObjectNotOfExpectedType {
+                        expected: ObjectType::FieldUnit,
+                        got: data.typ(),
+                    });
+                }
+            }
+            _ => {}
+        }
+
         let write_region = match field.kind {
             FieldUnitKind::Normal { ref region } => region,
 
@@ -2649,24 +2707,20 @@ where
                 region
             }
 
-            FieldUnitKind::Index { ref index, ref data } => {
-                // Write field.bit_index into the index register, then write to data register.
-                // This matches ACPICA exfldio.c IndexField handling.
-                let index_value = (field.bit_index / 8) as u64;
-                trace!("ACPI: IndexField write - writing index value {:#X}", index_value);
-                if let Object::FieldUnit(ref index_field) = **index {
-                    if let Err(err) = self.do_field_write(index_field, Object::Integer(index_value).wrap()) {
-                        warn!("ACPI: Failed to write index value {:#X}: {:?}. Continuing with data register.", index_value, err);
-                    }
-                } else {
-                    warn!("ACPI: Index register is not a FieldUnit ({:?}), skipping index write.", index.typ());
-                }
-                data
-            }
+            // Index is handled above and returns early
+            FieldUnitKind::Index { .. } => unreachable!(),
         };
+
+        // For Normal and Bank fields, the region object should be an OpRegion.
+        // However, on some firmware (like Futro S520), the region might itself be a
+        // FieldUnit. In that case, write to it recursively as a field.
+        if let Object::FieldUnit(ref nested_field) = **write_region {
+            warn!("ACPI: Region object is a FieldUnit instead of OpRegion, writing recursively.");
+            return self.do_field_write(nested_field, value);
+        }
         let Object::OpRegion(ref write_region) = **write_region else {
             return Err(AmlError::ObjectNotOfExpectedType {
-                expected: ObjectType::FieldUnit,
+                expected: ObjectType::OpRegion,
                 got: write_region.typ(),
             });
         };
